@@ -9,7 +9,7 @@
 
     <target name="compile">
         <mkdir dir="build"/>
-        <javac encoding="iso-8859-1" srcdir="src" destdir="build" includeantruntime="false">
+        <javac debug="true" encoding="iso-8859-1" srcdir="src" destdir="build" includeantruntime="false">
             <classpath>
                 <pathelement path="lib/gson-2.2.2.jar" />
                 <pathelement path="lib/commons-cli-1.4.jar" />
@@ -68,6 +68,31 @@
                 <pathelement location="lib/gson-2.2.2.jar"/>
                 <pathelement location="build"/>
             </classpath>
+        </java>
+    </target>
+
+    <target name="myaiwhite" description="Run MyAIClient as WHITE player">
+        <java classname="it.unibo.ai.didattica.competition.tablut.client.MyAIClient" fork="true">
+            <classpath>
+                <pathelement location="lib/gson-2.2.2.jar"/>
+                <pathelement location="build"/>
+            </classpath>
+            <arg value="WHITE"/>
+            <arg value="60"/>
+            <arg value="localhost"/>
+
+        </java>
+    </target>
+    
+    <target name="myaiblack" description="Run MyAIClient as BLACK player">
+        <java classname="it.unibo.ai.didattica.competition.tablut.client.MyAIClient" fork="true">
+            <classpath>
+                <pathelement location="lib/gson-2.2.2.jar"/>
+                <pathelement location="build"/>
+            </classpath>
+            <arg value="BLACK"/>
+            <arg value="60"/>
+            <arg value="localhost"/>
         </java>
     </target>
 
