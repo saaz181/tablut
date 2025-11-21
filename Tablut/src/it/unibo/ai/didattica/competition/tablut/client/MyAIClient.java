@@ -10,24 +10,33 @@ import it.unibo.ai.didattica.competition.tablut.domain.State.Turn;
 import java.io.IOException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Random;
+import java.util.stream.Collectors;
 
 public class MyAIClient extends TablutClient {
 
     private Game gameRules;
-    private long timeLimit = 58000; 
+    private long timeLimit = 58000;
     private Random random = new Random();
+
+    // UCT constant
+    private static final double UCT_C = 1.4;
+    // rollout randomness (epsilon)
+    private static final double ROLLOUT_EPSILON = 0.10;
+    // max moves in a single simulation
+    private static final int MAX_SIM_MOVES = 150;
 
     class Node {
         State state;
         Node parent;
         List<Node> children;
-        Action actionThatLedToThis; 
+        Action actionThatLedToThis;
 
         List<Action> untriedActions;
         int visits;
-        double wins; // win rate
+        double wins; // cumulative reward (from root player's perspective)
 
         Node(State state, Node parent, Action action) {
             this.state = state;
@@ -36,7 +45,7 @@ public class MyAIClient extends TablutClient {
             this.children = new ArrayList<>();
             this.visits = 0;
             this.wins = 0;
-            this.untriedActions = null; 
+            this.untriedActions = null;
         }
 
         boolean isTerminal() {
@@ -48,15 +57,13 @@ public class MyAIClient extends TablutClient {
             return untriedActions != null && untriedActions.isEmpty();
         }
 
-        
         double getUCT(int parentVisits) {
             if (this.visits == 0) {
-                return Double.MAX_VALUE; // Prioritize unvisited nodes
+                return Double.MAX_VALUE; // prioritize unvisited
             }
-            double exploitation = this.wins / this.visits;
-            // C-constant (sqrt(2)) balances exploration/exploitation
-            double exploration = Math.sqrt(2) * Math.sqrt(Math.log(parentVisits) / this.visits);
-            return exploitation + exploration;
+            double mean = this.wins / this.visits;
+            double exploration = UCT_C * Math.sqrt(Math.log(Math.max(1, parentVisits)) / this.visits);
+            return mean + exploration;
         }
     }
 
@@ -70,8 +77,7 @@ public class MyAIClient extends TablutClient {
         String name = "MyAIPlayerMCTS";
         int timeout = 60;
         String ip = "localhost";
-        
-        //  command-line arguments
+
         if (args.length > 0) role = args[0].toUpperCase();
         if (args.length > 1) timeout = Integer.parseInt(args[1]);
         if (args.length > 2) ip = args[2];
@@ -81,20 +87,21 @@ public class MyAIClient extends TablutClient {
         client.run();
     }
 
-    
     @Override
     public void run() {
         try {
             this.declareName();
-            System.out.println("AI (MCTS-FastSim) Connected. My role is: " + this.getPlayer().toString());
-        } catch (Exception e) { e.printStackTrace(); return; }
+            System.out.println("AI (MCTS-Improved) Connected. My role is: " + this.getPlayer().toString());
+        } catch (Exception e) {
+            e.printStackTrace();
+            return;
+        }
 
         while (true) {
             try {
-                // read the state from the server
-                this.read(); 
+                this.read();
                 State currentState = this.getCurrentState();
-                
+
                 if (currentState == null) {
                     System.err.println("Received null state from server. Waiting...");
                     try { Thread.sleep(500); } catch (InterruptedException e) { /* ignore */ }
@@ -102,14 +109,12 @@ public class MyAIClient extends TablutClient {
                 }
 
                 Turn currentTurn = currentState.getTurn();
-                
-                // Check for game over
+
                 if (currentTurn == Turn.WHITEWIN || currentTurn == Turn.BLACKWIN || currentTurn == Turn.DRAW) {
                     System.out.println("Game Over. Result: " + currentTurn);
                     break;
                 }
-                
-                // If it's our turn, think and play
+
                 if (currentTurn == this.getPlayer()) {
                     System.out.println("\nIt's my turn (" + this.getPlayer() + "). Thinking with MCTS...");
                     long startTime = System.currentTimeMillis();
@@ -117,7 +122,7 @@ public class MyAIClient extends TablutClient {
                     Action bestAction = findBestMove(currentState);
 
                     long endTime = System.currentTimeMillis();
-                    
+
                     if (bestAction == null) {
                         System.out.println("No valid move found by the AI. This should not happen.");
                         break;
@@ -134,44 +139,93 @@ public class MyAIClient extends TablutClient {
         }
     }
 
+    private List<Action> orderMovesByHeuristic(State state, List<Action> moves) {
+    List<Action> ordered = new ArrayList<>();
+    List<Integer> scores = new ArrayList<>();
+
+    for (Action a : moves) {
+        int s = fastEvaluateMove(state, a);
+        ordered.add(a);
+        scores.add(s);
+    }
+
+    // simple selection sort (stable with randomness)
+    for (int i = 0; i < ordered.size(); i++) {
+        int bestIndex = i;
+        for (int j = i + 1; j < ordered.size(); j++) {
+            if (scores.get(j) > scores.get(bestIndex)) {
+                bestIndex = j;
+            }
+        }
+        // swap
+        Action tmpA = ordered.get(i);
+        ordered.set(i, ordered.get(bestIndex));
+        ordered.set(bestIndex, tmpA);
+
+        int tmpS = scores.get(i);
+        scores.set(i, scores.get(bestIndex));
+        scores.set(bestIndex, tmpS);
+    }
+
+    return ordered;
+}
+
     private Action findBestMove(State currentState) throws IOException {
         ((GameAshtonTablut) this.gameRules).clearDrawConditions();
-        
+
         long startTime = System.currentTimeMillis();
         long endTime = startTime + this.timeLimit;
-        
-        Node root = new Node(currentState, null, null);
+
+        Node root = new Node(currentState.clone(), null, null); // clone to avoid side effects
         int simulationCount = 0;
 
+        // initialize root's untriedActions so expansion will have it ready
+        try {
+            root.untriedActions = new ArrayList<>(generatePossibleActions(root.state));
+            // order root moves to prefer better heuristics
+            root.untriedActions = orderMovesByHeuristic(root.state, root.untriedActions);
+
+            // root.untriedActions.sort(Comparator.comparingInt(a -> -fastEvaluateMove(root.state, a)));
+        } catch (IOException e) {
+            // fall back to empty list
+            root.untriedActions = new ArrayList<>();
+        }
+
         while (System.currentTimeMillis() < endTime) {
-            // find a promising node
             Node promisingNode = selection(root);
-            
-            // create one new child (if not terminal)
+
             Node expandedNode = promisingNode;
             if (!promisingNode.isTerminal()) {
-                expandedNode = expansion(promisingNode);
+                try {
+                    expandedNode = expansion(promisingNode);
+                } catch (Exception e) {
+                    // if expansion fails, skip this iteration
+                    continue;
+                }
             }
-            
-            double playoutResult = simulation(expandedNode.state, this.getPlayer());
-            
-            //  update wins/visits up the tree
+
+            double playoutResult = 0.5;
+            try {
+                playoutResult = simulation(expandedNode.state, this.getPlayer());
+            } catch (Exception e) {
+                playoutResult = 0.5;
+            }
+
             backpropagation(expandedNode, playoutResult);
-            
             simulationCount++;
         }
 
         System.out.println("MCTS completed " + simulationCount + " simulations in " + (System.currentTimeMillis() - startTime) + "ms.");
 
         Node bestChild = root.children.stream()
-            .filter(n -> n.visits > 0) // Avoid division by zero
-            .max((n1, n2) -> Double.compare(n1.wins / n1.visits, n2.wins / n2.visits))
-            .orElse(null);
+                .filter(n -> n.visits > 0)
+                .max((n1, n2) -> Double.compare(n1.wins / (double) n1.visits, n2.wins / (double) n2.visits))
+                .orElse(null);
 
         if (bestChild == null) {
             bestChild = root.children.stream()
-                .max((n1, n2) -> Integer.compare(n1.visits, n2.visits))
-                .orElse(null);
+                    .max((n1, n2) -> Integer.compare(n1.visits, n2.visits))
+                    .orElse(null);
         }
 
         if (bestChild == null) {
@@ -184,196 +238,230 @@ public class MyAIClient extends TablutClient {
     }
 
     private Node selection(Node node) {
-        while (!node.isTerminal()) {
-            if (!node.isFullyExpanded()) {
-                return node; 
+        Node current = node;
+        while (!current.isTerminal()) {
+            if (!current.isFullyExpanded()) {
+                return current;
             } else {
-                final int parentVisits = node.visits;
-                node = node.children.stream()
-                    .max((n1, n2) -> Double.compare(n1.getUCT(parentVisits), n2.getUCT(parentVisits)))
-                    .get(); // Get child with highest UCT score
+                final int parentVisits = Math.max(1, current.visits);
+                Node best = current.children.stream()
+                        .max((n1, n2) -> Double.compare(n1.getUCT(parentVisits), n2.getUCT(parentVisits)))
+                        .orElse(null);
+                if (best == null) break;
+                current = best;
             }
         }
-        return node;
+        return current;
     }
 
- 
-    
     private Node expansion(Node node) throws IOException {
         if (node.untriedActions == null) {
             node.untriedActions = new ArrayList<>(generatePossibleActions(node.state));
+            // order by heuristic descending so good moves are expanded earlier
+            node.untriedActions.sort(Comparator.comparingInt(a -> -fastEvaluateMove(node.state, a)));
         }
 
         if (node.untriedActions.isEmpty()) {
-            return node; 
+            return node;
         }
 
-        // Pop one random untried action
-        Action action = node.untriedActions.remove(random.nextInt(node.untriedActions.size()));
-        
-        // Apply the action 
+        Action action = node.untriedActions.remove(0); // take best available (already sorted)
+
         State newState = applyAction(node.state.clone(), action);
-        
-        // Create the new child node
+
         Node childNode = new Node(newState, node, action);
         node.children.add(childNode);
         return childNode;
     }
 
-    
     private double simulation(State state, Turn myPlayer) throws IOException {
         State simState = state.clone();
-        int maxSimMoves = 100;
         int moves = 0;
 
-        while (moves < maxSimMoves) {
+        while (moves < MAX_SIM_MOVES) {
             Turn winner = simState.getTurn();
-            
-            // Check for terminal state
+
             if (winner == Turn.WHITEWIN) return (myPlayer == Turn.WHITE) ? 1.0 : 0.0;
             if (winner == Turn.BLACKWIN) return (myPlayer == Turn.BLACK) ? 1.0 : 0.0;
             if (winner == Turn.DRAW) return 0.5;
 
-            // Get all legal moves 
             List<Action> possibleMoves = generatePossibleActions(simState);
-            if (possibleMoves.isEmpty()) return 0.5; // No moves = draw
+            if (possibleMoves.isEmpty()) return 0.5;
 
-            //  Pick the best "fast" move
-            Action bestSimMove = null;
-            int bestSimScore = Integer.MIN_VALUE;
-
-            for (Action action : possibleMoves) {
-                int score = fastEvaluateMove(simState, action);
-                if (score > bestSimScore) {
-                    bestSimScore = score;
-                    bestSimMove = action;
-                }
+            Action chosen;
+            if (random.nextDouble() < ROLLOUT_EPSILON) {
+                // explore
+                chosen = possibleMoves.get(random.nextInt(possibleMoves.size()));
+            } else {
+                // exploit: pick best according to quick heuristic, but to avoid bias,
+                // consider top-K and randomly choose among them
+                int K = Math.max(1, Math.min(5, possibleMoves.size()));
+                State currentSimState = simState;
+                List<Action> sorted = possibleMoves.stream()
+                        .sorted((a, b) -> Integer.compare(fastEvaluateMove(currentSimState, b), fastEvaluateMove(currentSimState, a)))
+                        .collect(Collectors.toList());
+                int pickIndex = random.nextInt(K);
+                chosen = sorted.get(pickIndex);
             }
-            
+
             try {
-                simState = this.gameRules.checkMove(simState, bestSimMove); 
+                simState = this.gameRules.checkMove(simState, chosen);
             } catch (Exception e) {
-                return 0.5; 
+                // if illegal or error, treat as draw or skip this move
+                return 0.5;
             }
             moves++;
+
+            // quick terminal check after move
+            Turn after = simState.getTurn();
+            if (after == Turn.WHITEWIN) return (myPlayer == Turn.WHITE) ? 1.0 : 0.0;
+            if (after == Turn.BLACKWIN) return (myPlayer == Turn.BLACK) ? 1.0 : 0.0;
+            if (after == Turn.DRAW) return 0.5;
         }
-        
-        return 0.5; // Max moves reached, call it a draw
+
+        return 0.5;
     }
 
-    
     private void backpropagation(Node node, double result) {
         Node temp = node;
         while (temp != null) {
             temp.visits++;
-            temp.wins += result;
-            temp = temp.parent; // Move up the tree
+
+            // Determine which player made the move that led to temp
+            // If actionThatLedToThis is null, it's the root; use result as-is
+            if (temp.actionThatLedToThis == null) {
+                temp.wins += result;
+            } else {
+                Turn mover = temp.actionThatLedToThis.getTurn();
+                if (mover == this.getPlayer()) {
+                    // mover is root player: reward as-is
+                    temp.wins += result;
+                } else {
+                    // mover is opponent: invert reward
+                    temp.wins += (1.0 - result);
+                }
+            }
+
+            temp = temp.parent;
         }
     }
 
-
-   
     private int fastEvaluateMove(State state, Action action) {
         int score = 0;
         Turn player = action.getTurn();
         Pawn[][] board = state.getBoard();
 
-        //  Check for captures
+        // simulate move locally for heuristic (without modifying original board)
+        int fromR = action.getRowFrom();
+        int fromC = action.getColumnFrom();
+        int toR = action.getRowTo();
+        int toC = action.getColumnTo();
+        Pawn moving = board[fromR][fromC];
+
+        // quick capture estimation
         int captures = fastSimulatedCaptureCheck(board, action);
         if (captures > 0) {
-            if (captures >= 10) score += 50000;
-            score += 1000 * captures; // High priority!
+            if (captures >= 10) score += 20000;
+            score += 2000 * captures;
         }
 
         if (player == Turn.WHITE) {
-            Pawn pawn = board[action.getRowFrom()][action.getColumnFrom()];
-            if (pawn == Pawn.KING) {
-                // Reward moving king closer to an escape
-                int distBefore = kingDistanceToEscape(action.getRowFrom(), action.getColumnFrom());
-                int distAfter = kingDistanceToEscape(action.getRowTo(), action.getColumnTo());
-                if (distAfter < distBefore) {
-                    score += 500;
-                }
-
-                // Reward moving *away* from black pawns
-                int nearestBlackPawnDistBefore = 100;
-                int nearestBlackPawnDistAfter = 100;
-                for (int r = 0; r < 9; r++) {
-                    for (int c = 0; c < 9; c++) {
-                        if (board[r][c] == Pawn.BLACK) {
-                            int distB = Math.abs(action.getRowFrom() - r) + Math.abs(action.getColumnFrom() - c);
-                            if (distB < nearestBlackPawnDistBefore) nearestBlackPawnDistBefore = distB;
-                            
-                            int distA = Math.abs(action.getRowTo() - r) + Math.abs(action.getColumnTo() - c);
-                            if (distA < nearestBlackPawnDistAfter) nearestBlackPawnDistAfter = distA;
-                        }
-                    }
-                }
-                if (nearestBlackPawnDistAfter > nearestBlackPawnDistBefore) {
-                    score += 100; // Reward moving *away* from danger
+            if (moving == Pawn.KING) {
+                int distBefore = kingDistanceToEscape(fromR, fromC);
+                int distAfter = kingDistanceToEscape(toR, toC);
+                if (distAfter < distBefore) score += 800;
+                // prefer increasing nearest black pawn distance
+                int beforeNearest = nearestEnemyDistance(board, fromR, fromC, Pawn.BLACK);
+                int afterNearest = nearestEnemyDistance(board, toR, toC, Pawn.BLACK);
+                if (afterNearest > beforeNearest) score += 200;
+            } else {
+                // white pawn heuristic: keep pawns nearer to king
+                int[] king = findKing(board);
+                if (king[0] != -1) {
+                    int before = Math.abs(fromR - king[0]) + Math.abs(fromC - king[1]);
+                    int after = Math.abs(toR - king[0]) + Math.abs(toC - king[1]);
+                    if (after < before) score += 80; // support king
+                    else score -= 20;
                 }
             }
-        } else { 
-            // player is BLACK
-            // Find the king 
-            int[] kingPos = findKing(board);
-            
-            if (kingPos[0] != -1) {
-                // Reward moving a pawn closer to the king
-                int distBefore = Math.abs(action.getRowFrom() - kingPos[0]) + Math.abs(action.getColumnFrom() - kingPos[1]);
-                int distAfter = Math.abs(action.getRowTo() - kingPos[0]) + Math.abs(action.getColumnTo() - kingPos[1]);
-                if (distAfter < distBefore) {
-                    score += 200;
-                }
-                
-                // Reward blocking an escape route
-                int r = action.getRowTo();
-                int c = action.getColumnTo();
-                if (r == kingPos[0] || c == kingPos[1]) { 
-                    // Moving onto the king's row or column
-                    score += 50; 
-                }
+        } else {
+            // BLACK heuristics
+            int[] king = findKing(board);
+            if (king[0] != -1) {
+                int before = Math.abs(fromR - king[0]) + Math.abs(fromC - king[1]);
+                int after = Math.abs(toR - king[0]) + Math.abs(toC - king[1]);
+                if (after < before) score += 300;
+                if (toR == king[0] || toC == king[1]) score += 60; // on same row/col as king
             }
+            // penalize leaving large gaps
+            score += random.nextInt(8);
         }
 
-        // randomness to break ties
-        score += random.nextInt(10);
-        
+        // small random tie-breaker
+        score += random.nextInt(20);
+
         return score;
     }
 
-    
+    private int nearestEnemyDistance(Pawn[][] board, int r, int c, Pawn enemyPawn) {
+        int best = 100;
+        for (int rr = 0; rr < 9; rr++) {
+            for (int cc = 0; cc < 9; cc++) {
+                if (board[rr][cc] == enemyPawn) {
+                    int d = Math.abs(r - rr) + Math.abs(c - cc);
+                    if (d < best) best = d;
+                }
+            }
+        }
+        return best;
+    }
+
     private int fastSimulatedCaptureCheck(Pawn[][] board, Action action) {
         int captures = 0;
         int r = action.getRowTo();
         int c = action.getColumnTo();
         Turn turn = action.getTurn();
-        
+
         Pawn enemy = (turn == Turn.WHITE) ? Pawn.BLACK : Pawn.WHITE;
         Pawn ally = (turn == Turn.WHITE) ? Pawn.WHITE : Pawn.BLACK;
         Pawn king = Pawn.KING;
 
-        // Check for captures UP (r-1)
-        if (r > 1 && (board[r-1][c] == enemy || board[r-1][c] == king) && (board[r-2][c] == ally || board[r-2][c] == king || isHostileSquare(r-2, c))) {
-            if (board[r-1][c] == king) captures += 10; // Capturing king
-            else captures++;
+        // Helper to check bounds
+        java.util.function.BiPredicate<Integer, Integer> inBounds = (rr, cc) -> rr >= 0 && rr < 9 && cc >= 0 && cc < 9;
+
+        // UP
+        if (inBounds.test(r - 1, c) && inBounds.test(r - 2, c)) {
+            Pawn mid = board[r - 1][c];
+            Pawn beyond = board[r - 2][c];
+            if ((mid == enemy || mid == king) && (beyond == ally || beyond == king || isHostileSquare(r - 2, c))) {
+                if (mid == king) captures += 10; else captures++;
+            }
         }
-        // Check for captures DOWN (r+1)
-        if (r < 7 && (board[r+1][c] == enemy || board[r+1][c] == king) && (board[r+2][c] == ally || board[r+2][c] == king || isHostileSquare(r+2, c))) {
-            if (board[r+1][c] == king) captures += 10;
-            else captures++;
+        // DOWN
+        if (inBounds.test(r + 1, c) && inBounds.test(r + 2, c)) {
+            Pawn mid = board[r + 1][c];
+            Pawn beyond = board[r + 2][c];
+            if ((mid == enemy || mid == king) && (beyond == ally || beyond == king || isHostileSquare(r + 2, c))) {
+                if (mid == king) captures += 10; else captures++;
+            }
         }
-        // Check for captures LEFT (c-1)
-        if (c > 1 && (board[r][c-1] == enemy || board[r][c-1] == king) && (board[r][c-2] == ally || board[r][c-2] == king || isHostileSquare(r, c-2))) {
-            if (board[r][c-1] == king) captures += 10;
-            else captures++;
+        // LEFT
+        if (inBounds.test(r, c - 1) && inBounds.test(r, c - 2)) {
+            Pawn mid = board[r][c - 1];
+            Pawn beyond = board[r][c - 2];
+            if ((mid == enemy || mid == king) && (beyond == ally || beyond == king || isHostileSquare(r, c - 2))) {
+                if (mid == king) captures += 10; else captures++;
+            }
         }
-        // Check for captures RIGHT (c+1)
-        if (c < 7 && (board[r][c+1] == enemy || board[r][c+1] == king) && (board[r][c+2] == ally || board[r][c+2] == king || isHostileSquare(r, c+2))) {
-            if (board[r][c+1] == king) captures += 10;
-            else captures++;
+        // RIGHT
+        if (inBounds.test(r, c + 1) && inBounds.test(r, c + 2)) {
+            Pawn mid = board[r][c + 1];
+            Pawn beyond = board[r][c + 2];
+            if ((mid == enemy || mid == king) && (beyond == ally || beyond == king || isHostileSquare(r, c + 2))) {
+                if (mid == king) captures += 10; else captures++;
+            }
         }
-        
+
         return captures;
     }
 
@@ -385,10 +473,9 @@ public class MyAIClient extends TablutClient {
                 }
             }
         }
-        return new int[]{-1, -1}; // Not found
+        return new int[]{-1, -1};
     }
 
-    //find the King's Manhattan distance to the closest edge
     private int kingDistanceToEscape(int r, int c) {
         int distN = r;
         int distS = 8 - r;
@@ -397,11 +484,11 @@ public class MyAIClient extends TablutClient {
         return Math.min(Math.min(distN, distS), Math.min(distW, distE));
     }
 
-
     private State applyAction(State state, Action action) {
         try {
             return this.gameRules.checkMove(state, action);
         } catch (Exception e) {
+            // print stack for debugging but return unchanged state to avoid crash
             e.printStackTrace();
             return state;
         }
@@ -411,45 +498,36 @@ public class MyAIClient extends TablutClient {
         List<Action> validActions = new ArrayList<>();
         Turn player = state.getTurn();
         Pawn[][] board = state.getBoard();
-        
+
         for (int r = 0; r < 9; r++) {
             for (int c = 0; c < 9; c++) {
                 Pawn currentPawn = board[r][c];
-
                 boolean isMyPawn = false;
                 if (player.equals(Turn.WHITE) && (currentPawn.equals(Pawn.WHITE) || currentPawn.equals(Pawn.KING))) { isMyPawn = true; }
                 else if (player.equals(Turn.BLACK) && currentPawn.equals(Pawn.BLACK)) { isMyPawn = true; }
 
                 if (isMyPawn) {
                     String from = state.getBox(r, c);
-                    
-                    // Check moves UP
+
+                    // UP
                     for (int rowTo = r - 1; rowTo >= 0; rowTo--) {
-                        if (board[rowTo][c] != Pawn.EMPTY || isCitadel(rowTo, c)) break; // Path blocked
-                        if (isMoveLegal(currentPawn, rowTo, c)) {
-                            validActions.add(new Action(from, state.getBox(rowTo, c), player));
-                        }
+                        if (board[rowTo][c] != Pawn.EMPTY || isCitadel(rowTo, c)) break;
+                        if (isMoveLegal(currentPawn, rowTo, c)) validActions.add(new Action(from, state.getBox(rowTo, c), player));
                     }
-                    // Check moves DOWN
+                    // DOWN
                     for (int rowTo = r + 1; rowTo < 9; rowTo++) {
                         if (board[rowTo][c] != Pawn.EMPTY || isCitadel(rowTo, c)) break;
-                        if (isMoveLegal(currentPawn, rowTo, c)) {
-                            validActions.add(new Action(from, state.getBox(rowTo, c), player));
-                        }
+                        if (isMoveLegal(currentPawn, rowTo, c)) validActions.add(new Action(from, state.getBox(rowTo, c), player));
                     }
-                    // Check moves LEFT
+                    // LEFT
                     for (int colTo = c - 1; colTo >= 0; colTo--) {
                         if (board[r][colTo] != Pawn.EMPTY || isCitadel(r, colTo)) break;
-                        if (isMoveLegal(currentPawn, r, colTo)) {
-                            validActions.add(new Action(from, state.getBox(r, colTo), player));
-                        }
+                        if (isMoveLegal(currentPawn, r, colTo)) validActions.add(new Action(from, state.getBox(r, colTo), player));
                     }
-                    // Check moves RIGHT
+                    // RIGHT
                     for (int colTo = c + 1; colTo < 9; colTo++) {
                         if (board[r][colTo] != Pawn.EMPTY || isCitadel(r, colTo)) break;
-                        if (isMoveLegal(currentPawn, r, colTo)) {
-                            validActions.add(new Action(from, state.getBox(r, colTo), player));
-                        }
+                        if (isMoveLegal(currentPawn, r, colTo)) validActions.add(new Action(from, state.getBox(r, colTo), player));
                     }
                 }
             }
@@ -457,20 +535,17 @@ public class MyAIClient extends TablutClient {
         return validActions;
     }
 
-    // Checks if a pawn can legally LAND on a square
     private boolean isMoveLegal(Pawn pawn, int rTo, int cTo) {
-        if (rTo == 4 && cTo == 4) return pawn.equals(Pawn.KING); // Only king can land on Throne
-        if (isCitadel(rTo, cTo)) return false; // No pawn can land on a citadel
+        if (rTo == 4 && cTo == 4) return pawn.equals(Pawn.KING);
+        if (isCitadel(rTo, cTo)) return false;
         return true;
     }
-    
-    // Checks if a square is a "hostile" square (Throne or Citadel) for captures
+
     private boolean isHostileSquare(int r, int c) {
-        if (r == 4 && c == 4) return true; // Throne
+        if (r == 4 && c == 4) return true;
         return isCitadel(r, c);
     }
 
-    // Checks if a square is a citadel (not the throne)
     private boolean isCitadel(int r, int c) {
         if (r == 0 && (c == 3 || c == 4 || c == 5)) return true;
         if (r == 1 && c == 4) return true;
